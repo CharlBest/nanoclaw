@@ -1,7 +1,9 @@
+import fs from 'fs';
 import https from 'https';
+import path from 'path';
 import { Api, Bot } from 'grammy';
 
-import { ASSISTANT_NAME, TRIGGER_PATTERN } from '../config.js';
+import { ASSISTANT_NAME, GROUPS_DIR, TRIGGER_PATTERN } from '../config.js';
 import { readEnvFile } from '../env.js';
 import { logger } from '../logger.js';
 import { registerChannel, ChannelOpts } from './registry.js';
@@ -11,6 +13,52 @@ import {
   OnInboundMessage,
   RegisteredGroup,
 } from '../types.js';
+
+/**
+ * Download a Telegram file to the group's workspace photos directory.
+ * Returns the local file path on success, or null on failure.
+ */
+async function downloadTelegramPhoto(
+  api: Api,
+  fileId: string,
+  groupFolder: string,
+  filename: string,
+): Promise<string | null> {
+  try {
+    const file = await api.getFile(fileId);
+    if (!file.file_path) {
+      logger.warn({ fileId }, 'Telegram file has no file_path');
+      return null;
+    }
+
+    const token = api.token;
+    const url = `https://api.telegram.org/file/bot${token}/${file.file_path}`;
+
+    const photosDir = path.join(GROUPS_DIR, groupFolder, 'photos');
+    fs.mkdirSync(photosDir, { recursive: true });
+
+    const ext = path.extname(file.file_path) || '.jpg';
+    const localPath = path.join(photosDir, `${filename}${ext}`);
+
+    await new Promise<void>((resolve, reject) => {
+      const out = fs.createWriteStream(localPath);
+      https.get(url, (res) => {
+        if (res.statusCode !== 200) {
+          reject(new Error(`HTTP ${res.statusCode}`));
+          return;
+        }
+        res.pipe(out);
+        out.on('finish', () => { out.close(); resolve(); });
+      }).on('error', reject);
+    });
+
+    logger.info({ localPath, fileId }, 'Telegram photo downloaded');
+    return localPath;
+  } catch (err) {
+    logger.error({ fileId, err }, 'Failed to download Telegram photo');
+    return null;
+  }
+}
 
 export interface TelegramChannelOpts {
   onMessage: OnInboundMessage;
@@ -199,7 +247,50 @@ export class TelegramChannel implements Channel {
       });
     };
 
-    this.bot.on('message:photo', (ctx) => storeNonText(ctx, '[Photo]'));
+    this.bot.on('message:photo', async (ctx) => {
+      const chatJid = `tg:${ctx.chat.id}`;
+      const group = this.opts.registeredGroups()[chatJid];
+      if (!group) return;
+
+      // Get the highest-resolution photo (last in array)
+      const photos = ctx.message.photo;
+      const best = photos[photos.length - 1];
+      const timestamp = new Date(ctx.message.date * 1000);
+      const senderName =
+        ctx.from?.first_name ||
+        ctx.from?.username ||
+        ctx.from?.id?.toString() ||
+        'Unknown';
+      const caption = ctx.message.caption ? ` ${ctx.message.caption}` : '';
+      const dateStr = timestamp.toISOString().slice(0, 10);
+      const filename = `photo-${dateStr}-${ctx.message.message_id}`;
+
+      // Download photo to group workspace
+      const localPath = await downloadTelegramPhoto(
+        this.bot!.api,
+        best.file_id,
+        group.folder,
+        filename,
+      );
+
+      // Include workspace-relative path so the container agent can read the image
+      const photoRef = localPath
+        ? ` [saved: /workspace/group/photos/${path.basename(localPath)}]`
+        : '';
+
+      const isGroup =
+        ctx.chat.type === 'group' || ctx.chat.type === 'supergroup';
+      this.opts.onChatMetadata(chatJid, timestamp.toISOString(), undefined, 'telegram', isGroup);
+      this.opts.onMessage(chatJid, {
+        id: ctx.message.message_id.toString(),
+        chat_jid: chatJid,
+        sender: ctx.from?.id?.toString() || '',
+        sender_name: senderName,
+        content: `[Photo]${caption}${photoRef}`,
+        timestamp: timestamp.toISOString(),
+        is_from_me: false,
+      });
+    });
     this.bot.on('message:video', (ctx) => storeNonText(ctx, '[Video]'));
     this.bot.on('message:voice', (ctx) => storeNonText(ctx, '[Voice message]'));
     this.bot.on('message:audio', (ctx) => storeNonText(ctx, '[Audio]'));
@@ -289,6 +380,85 @@ export class TelegramChannel implements Channel {
     } catch (err) {
       logger.debug({ jid, err }, 'Failed to send Telegram typing indicator');
     }
+  }
+}
+
+// Bot pool for agent teams: send-only Api instances (no polling)
+const poolApis: Api[] = [];
+// Maps "{groupFolder}:{senderName}" → pool Api index for stable assignment
+const senderBotMap = new Map<string, number>();
+let nextPoolIndex = 0;
+
+/**
+ * Initialize send-only Api instances for the bot pool.
+ * Each pool bot can send messages but doesn't poll for updates.
+ */
+export async function initBotPool(tokens: string[]): Promise<void> {
+  for (const token of tokens) {
+    try {
+      const api = new Api(token);
+      const me = await api.getMe();
+      poolApis.push(api);
+      logger.info(
+        { username: me.username, id: me.id, poolSize: poolApis.length },
+        'Pool bot initialized',
+      );
+    } catch (err) {
+      logger.error({ err }, 'Failed to initialize pool bot');
+    }
+  }
+  if (poolApis.length > 0) {
+    logger.info({ count: poolApis.length }, 'Telegram bot pool ready');
+  }
+}
+
+/**
+ * Send a message via a pool bot assigned to the given sender name.
+ * Assigns bots round-robin on first use; subsequent messages from the
+ * same sender in the same group always use the same bot.
+ * On first assignment, renames the bot to match the sender's role.
+ */
+export async function sendPoolMessage(
+  chatId: string,
+  text: string,
+  sender: string,
+  groupFolder: string,
+): Promise<void> {
+  if (poolApis.length === 0) {
+    // No pool bots — fall back to main bot sendMessage on the class
+    return;
+  }
+
+  const key = `${groupFolder}:${sender}`;
+  let idx = senderBotMap.get(key);
+  if (idx === undefined) {
+    idx = nextPoolIndex % poolApis.length;
+    nextPoolIndex++;
+    senderBotMap.set(key, idx);
+    // Rename the bot to match the sender's role, then wait for Telegram to propagate
+    try {
+      await poolApis[idx].setMyName(sender);
+      await new Promise((r) => setTimeout(r, 2000));
+      logger.info({ sender, groupFolder, poolIndex: idx }, 'Assigned and renamed pool bot');
+    } catch (err) {
+      logger.warn({ sender, err }, 'Failed to rename pool bot (sending anyway)');
+    }
+  }
+
+  const api = poolApis[idx];
+  try {
+    const numericId = chatId.replace(/^tg:/, '');
+    const MAX_LENGTH = 4096;
+    if (text.length <= MAX_LENGTH) {
+      await sendTelegramMessage(api, numericId, text);
+    } else {
+      for (let i = 0; i < text.length; i += MAX_LENGTH) {
+        await sendTelegramMessage(api, numericId, text.slice(i, i + MAX_LENGTH));
+      }
+    }
+    logger.info({ chatId, sender, poolIndex: idx, length: text.length }, 'Pool message sent');
+  } catch (err) {
+    logger.error({ chatId, sender, err }, 'Failed to send pool message');
   }
 }
 
